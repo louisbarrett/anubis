@@ -64,6 +64,12 @@ var (
 	runningJobs = new(sync.WaitGroup)
 
 	responseData string
+
+	client = redis.NewClient(&redis.Options{
+		Addr:     redisCluster + ":6379",
+		Password: "",
+		DB:       0,
+	})
 )
 
 func queryPassiveTotal(endpoint string, Query string) string {
@@ -186,11 +192,7 @@ func anubisVerify(IPAddress string, checkCache bool, recordExpiration int, wg *s
 	// Check if caching is enabled
 	if checkCache {
 		// Create redis client
-		client := redis.NewClient(&redis.Options{
-			Addr:     redisCluster + ":6379",
-			Password: "",
-			DB:       0,
-		})
+
 		// Check redis cluster status
 		_, clientError := client.Ping().Result()
 		if clientError != nil {
@@ -228,11 +230,7 @@ func anubisVerify(IPAddress string, checkCache bool, recordExpiration int, wg *s
 		responseContainer.SetP(hybridAnalysisResponse.Data(), "HybridAnalysis")
 		redisData = responseContainer.String()
 		if checkCache && cacheMiss != nil {
-			client := redis.NewClient(&redis.Options{
-				Addr:     redisCluster + ":6379",
-				Password: "",
-				DB:       0,
-			})
+
 			_, err := client.SetNX(IPAddress, redisData, 336*time.Hour).Result()
 
 			if err != nil {
