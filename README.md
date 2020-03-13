@@ -8,9 +8,15 @@ A cache backed lookup service for IP Addresses leveraging AbuseIPDB, RiskIQ, Vir
 ```
 Usage of anubis
   -cli
-        CLI Mode use when running outside VPC
+        CLI Mode
+  -dev
+        Internal development
   -ip string
         IP Address to lookup
+  -json
+        Output in JSON
+  -lambda
+        Toggle lambda execution
   -log
         Enable debug output
 ```
