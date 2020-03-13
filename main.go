@@ -338,7 +338,7 @@ func handleRequest() {
 	runningJobs.Add(len(BulkLookup))
 	// Run anubis verification on addresses
 	for index := range BulkLookup {
-		go anubisVerify(BulkLookup[index], false, 336, runningJobs)
+		go anubisVerify(BulkLookup[index], true, 336, runningJobs)
 	}
 	runningJobs.Wait()
 
@@ -346,6 +346,11 @@ func handleRequest() {
 
 func main() {
 	flag.Parse()
+
+	if os.Getenv("DEBUG") == "TRUE" {
+		flag.Set("log", "true")
+
+	}
 	// CLI Execution options
 	if *flagCLI {
 		IPAddress := *flagIPAddress
