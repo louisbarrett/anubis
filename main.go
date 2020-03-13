@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,7 +30,7 @@ type anubisResponse struct {
 	IPAddress   string
 	ASName      interface{}
 	ASNumber    interface{}
-	Domain      string
+	Domain      interface{}
 	Country     interface{}
 	Usage       interface{}
 	Compromised interface{}
@@ -40,14 +42,12 @@ type anubisResponse struct {
 }
 
 var (
-	redisCluster     = os.Getenv("REDIS_CLUSTER")
-	recordExpiration = 336                        // Number of hours to store cached record
-	abuseDBKey       = os.Getenv("ABUSEDBSECRET") //
-	abuseDBBaseURL   = "https://www.abuseipdb.com/api/v2/check/"
-	// PTuserName PassiveTotal account name
-	PTuserName = os.Getenv("PTUSER")
-	// PTAPIKey PassiveTotal API Key
-	PTAPIKey             = os.Getenv("PTAPIKEY")
+	redisCluster         = os.Getenv("REDIS_CLUSTER")
+	recordExpiration     = 336                        // Number of hours to store cached record
+	abuseDBKey           = os.Getenv("ABUSEDBSECRET") //
+	abuseDBBaseURL       = "https://www.abuseipdb.com/api/v2/check/"
+	ptUserName           = os.Getenv("PTUSER")
+	ptAPIKey             = os.Getenv("PTAPIKEY")
 	hybridAnalysisKey    = os.Getenv("HAKEY")
 	hybridAnalysisSecret = os.Getenv("HASECRET")
 	vtAPIKey             = os.Getenv("VTAPIKEY")
@@ -72,7 +72,7 @@ func queryPassiveTotal(endpoint string, Query string) string {
 	}
 	httpClient := http.Client{}
 	httpRequest, err := http.NewRequest("GET", endpoint+"?query="+Query, nil)
-	httpRequest.SetBasicAuth(PTuserName, PTAPIKey)
+	httpRequest.SetBasicAuth(ptUserName, ptAPIKey)
 	httpResponse, err := httpClient.Do(httpRequest)
 	responseBytes := httpResponse.Body
 	message, err := ioutil.ReadAll(responseBytes)
@@ -88,7 +88,7 @@ func queryPassiveTotal(endpoint string, Query string) string {
 func queryAccountQuotas() {
 	httpClient := http.Client{}
 	httpRequest, err := http.NewRequest("GET", "https://api.passivetotal.org/v2/account/quota", nil)
-	httpRequest.SetBasicAuth(PTuserName, PTAPIKey)
+	httpRequest.SetBasicAuth(ptUserName, ptAPIKey)
 	httpResponse, err := httpClient.Do(httpRequest)
 	responseBytes := httpResponse.Body
 	message, err := ioutil.ReadAll(responseBytes)
@@ -172,7 +172,7 @@ func queryVirusTotal(IPAddress string) string {
 	message, err := ioutil.ReadAll(responseBytes)
 	prettyPrint, err := gabs.ParseJSON(message)
 	if err != nil {
-		log.Fatal("Virus Total Error ", err)
+		log.Fatal("VirusTotal Error ", err, IPAddress)
 	}
 	response := string(prettyPrint.String())
 	// fmt.Println(response)
@@ -249,16 +249,36 @@ func anubisVerify(IPAddress string, checkCache bool, recordExpiration int, wg *s
 		log.Fatal(err)
 	}
 
+	// response validation
+	var vtScoreMal float64
+	if responseContainer.Path("VirusTotal.data.attributes.last_analysis_stats.malicious").Data() == nil {
+		vtScoreMal = 0
+	} else {
+		vtScoreMal = responseContainer.Path("VirusTotal.data.attributes.last_analysis_stats.malicious").Data().(float64)
+	}
+	var vtScoreSus float64
+	if responseContainer.Path("VirusTotal.data.attributes.last_analysis_stats.suspicious").Data() == nil {
+		vtScoreSus = 0
+	} else {
+		vtScoreSus = responseContainer.Path("VirusTotal.data.attributes.last_analysis_stats.suspicious").Data().(float64)
+	}
+	var AIDBScore float64
+	if responseContainer.Path("AbuseDB.data.abuseConfidenceScore").Data() == nil {
+		AIDBScore = 0
+	} else {
+		AIDBScore = responseContainer.Path("AbuseDB.data.abuseConfidenceScore").Data().(float64)
+	}
+
 	abuseReport := anubisResponse{
 		IPAddress:   IPAddress,
 		ASName:      (responseContainer.Path("RiskIQ.autonomousSystemName").Data()),
 		ASNumber:    responseContainer.Path("RiskIQ.autonomousSystemNumber").Data(),
-		Domain:      responseContainer.Path("AbuseDB.data.domain").Data().(string),
+		Domain:      responseContainer.Path("AbuseDB.data.domain").Data(),
 		Country:     responseContainer.Path("RiskIQ.country").Data(),
 		Usage:       responseContainer.Path("AbuseDB.data.usageType").Data(),
-		vtScoreMal:  responseContainer.Path("VirusTotal.data.attributes.last_analysis_stats.malicious").Data().(float64) * 10,
-		vtScoreSus:  responseContainer.Path("VirusTotal.data.attributes.last_analysis_stats.suspicious").Data().(float64) * 10,
-		AIDBScore:   responseContainer.Path("AbuseDB.data.abuseConfidenceScore").Data().(float64),
+		vtScoreMal:  vtScoreMal * 10,
+		vtScoreSus:  vtScoreSus * 10,
+		AIDBScore:   AIDBScore,
 		Compromised: responseContainer.Path("RiskIQ.everCompromised"),
 	}
 
@@ -276,8 +296,6 @@ func anubisVerify(IPAddress string, checkCache bool, recordExpiration int, wg *s
 	}
 
 	// Send response to the appropriate channel
-	// rawReport <- abuseReport
-	// fmt.Println(abuseReport)
 	if *flagJSON {
 		reportJSON := gabs.Wrap(abuseReport)
 		fmt.Println(reportJSON.String())
@@ -299,16 +317,35 @@ func anubisVerify(IPAddress string, checkCache bool, recordExpiration int, wg *s
 }
 
 func handleRequest() {
-	IPAddress := os.Getenv("IPADDRESS")
-	runningJobs.Add(1)
-	go anubisVerify(IPAddress, false, recordExpiration, runningJobs)
+	// Import Bulk list of IP addresses from File, S3,http, or Event
+	// IPListURL := "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/cleantalk_new_1d.ipset"
+	IPListURL := os.Getenv("IPLISTURL")
+	IPListResponse, _ := http.Get(IPListURL)
+	responseBytes, _ := ioutil.ReadAll(IPListResponse.Body)
+	responseString := string(responseBytes)
+	responseSlice := strings.Split(responseString, "\n")
+
+	BulkLookup := []string{}
+	for i := range responseSlice {
+		lineComment, _ := regexp.Match("^#", []byte(responseSlice[i]))
+		if !lineComment && responseSlice[i] != "" {
+			// Remove network masks
+			responseSlice[i] = strings.Split(responseSlice[i], "/")[0]
+			BulkLookup = append(BulkLookup, responseSlice[i])
+		}
+	}
+	// Add IP addresses to queue
+	runningJobs.Add(len(BulkLookup))
+	// Run anubis verification on addresses
+	for index := range BulkLookup {
+		go anubisVerify(BulkLookup[index], false, 336, runningJobs)
+	}
 	runningJobs.Wait()
 
 }
 
 func main() {
 	flag.Parse()
-	flag.Set("lambda", "false")
 	// CLI Execution options
 	if *flagCLI {
 		IPAddress := *flagIPAddress
@@ -320,23 +357,7 @@ func main() {
 	if os.Getenv("LAMBDA") == "TRUE" {
 		lambda.Start(handleRequest)
 	}
-	// development flags
 	if *flagDev {
-
-		// Import Bulk list of IP addresses from File, S3, or Event
-
-		BulkLookup := []string{}
-		// Process list of IP addresses
-		BulkLookup = append(BulkLookup, "120.79.27.209")
-		BulkLookup = append(BulkLookup, "120.79.27.249")
-		BulkLookup = append(BulkLookup, "12.79.27.209")
-
-		// Run anubis verification on addresses
-		runningJobs.Add(len(BulkLookup))
-		for index := range BulkLookup {
-			go anubisVerify(BulkLookup[index], false, 336, runningJobs)
-		}
-		runningJobs.Wait()
 	}
 
 }
