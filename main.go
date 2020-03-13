@@ -317,7 +317,7 @@ func main() {
 		runningJobs.Wait()
 	}
 	// Lambda execution options
-	if *flagLambda {
+	if os.Getenv("LAMBDA") == "TRUE" {
 		lambda.Start(handleRequest)
 	}
 	// development flags
