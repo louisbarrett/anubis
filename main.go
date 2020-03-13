@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/Jeffail/gabs/v2"
@@ -23,13 +24,26 @@ const (
 	hybridAnalyisBaseURL = "https://www.hybrid-analysis.com/api/v2/search/terms"
 )
 
+type anubisResponse struct {
+	IPAddress   string
+	ASName      interface{}
+	ASNumber    interface{}
+	Domain      string
+	Country     interface{}
+	Usage       interface{}
+	Compromised interface{}
+	vtScoreMal  float64
+	vtScoreSus  float64
+	AIDBScore   float64
+	Total       float64
+	RiskRating  string
+}
+
 var (
 	redisCluster     = os.Getenv("REDIS_CLUSTER")
-	recordExpiration = time.Now()
-	// BRUH
-	abuseDBKey     = os.Getenv("ABUSEDBSECRET") //
-	abuseDBBaseURL = "https://www.abuseipdb.com/api/v2/check/"
-
+	recordExpiration = 336                        // Number of hours to store cached record
+	abuseDBKey       = os.Getenv("ABUSEDBSECRET") //
+	abuseDBBaseURL   = "https://www.abuseipdb.com/api/v2/check/"
 	// PTuserName PassiveTotal account name
 	PTuserName = os.Getenv("PTUSER")
 	// PTAPIKey PassiveTotal API Key
@@ -38,13 +52,18 @@ var (
 	hybridAnalysisSecret = os.Getenv("HASECRET")
 	vtAPIKey             = os.Getenv("VTAPIKEY")
 
-	// flagIPAddress = os.Getenv("IPADDRESS")
+	flagLambda    = flag.Bool("lambda", false, "Toggle lambda execution")
 	flagIPAddress = flag.String("ip", "", "IP Address to lookup")
 	flagCLI       = flag.Bool("cli", false, "CLI Mode")
 	flagLog       = flag.Bool("log", false, "Enable debug output")
+	flagDev       = flag.Bool("dev", false, "Internal development")
+	flagJSON      = flag.Bool("json", false, "Output in JSON")
 
 	virusTotalBaseURL = "https://www.virustotal.com/api/v3/ip_addresses/"
-	responseData      string
+
+	runningJobs = new(sync.WaitGroup)
+
+	responseData string
 )
 
 func queryPassiveTotal(endpoint string, Query string) string {
@@ -80,7 +99,7 @@ func queryAccountQuotas() {
 	fmt.Println(string(prettyPrint.String()))
 }
 
-func checkIPReputation(IPAddress string) string {
+func checkAbuseDB(IPAddress string) string {
 	if *flagLog {
 		fmt.Println("Running AbuseIP DB queries")
 	}
@@ -160,68 +179,47 @@ func queryVirusTotal(IPAddress string) string {
 	return response
 }
 
-func main() {
-	flag.Parse()
-	if *flagCLI {
-
-		handleRequest()
-	} else {
-		lambda.Start(handleRequest)
-	}
-}
-
-func handleRequest() {
-	var IPAddress string
+func anubisVerify(IPAddress string, checkCache bool, recordExpiration int, wg *sync.WaitGroup) {
 	var cacheMiss error
-
-	// CLI Mode
-
-	// // parse build flag
-	if !*flagCLI {
-		IPAddress = os.Getenv("IPADDRESS")
-
+	var redisData string
+	defer wg.Done()
+	// Check if caching is enabled
+	if checkCache {
+		// Create redis client
 		client := redis.NewClient(&redis.Options{
 			Addr:     redisCluster + ":6379",
-			Password: "", // no password set
-			DB:       0,  // use default DB
+			Password: "",
+			DB:       0,
 		})
-
 		// Check redis cluster status
 		_, clientError := client.Ping().Result()
 		if clientError != nil {
-			if !*flagCLI {
-				log.Fatal(clientError)
-			}
+			log.Fatal(clientError)
+			wg.Done()
 		}
+		// Capture cache response
 		responseData, cacheMiss = client.Get(IPAddress).Result()
 		if responseData != "" {
-			fmt.Println("cache hit!")
+			if *flagLog {
+				log.Println("cache hit for", IPAddress)
+			}
 		}
-
-	} else {
-		IPAddress = *flagIPAddress
 	}
-
-	var redisData string
-	if cacheMiss != nil || *flagCLI {
-
-		// Adding missing record
-		if cacheMiss != nil {
+	// Perform API lookups
+	if cacheMiss != nil || checkCache == false {
+		// Log lookup
+		if *flagLog {
 			log.Println("Record", IPAddress, "not found in cache, performing lookup")
-			// Sample IP - 91.213.233.25 - CN - Malicious
 			// Sample IP - 120.79.27.209 - CN - Malicious
 		}
-		// fmt.Println(IPAddress)
-
 		// VirusTotal
 		vtResponse, _ := gabs.ParseJSON([]byte(queryVirusTotal(IPAddress)))
 		// AbuseIPDB Check
-		abuseDBResponse, _ := gabs.ParseJSON([]byte(checkIPReputation(IPAddress)))
+		abuseDBResponse, _ := gabs.ParseJSON([]byte(checkAbuseDB(IPAddress)))
 		// Passive Total
 		passiveTotalResponse, _ := gabs.ParseJSON([]byte(queryPassiveTotal(enrichment, IPAddress)))
 		// HybridAnalysis
 		hybridAnalysisResponse, _ := gabs.ParseJSON([]byte(queryHybridAnalysis(IPAddress)))
-
 		// update response object
 		responseContainer := gabs.New()
 		responseContainer.SetP(abuseDBResponse.Data(), "AbuseDB")
@@ -229,51 +227,116 @@ func handleRequest() {
 		responseContainer.SetP(vtResponse.Data(), "VirusTotal")
 		responseContainer.SetP(hybridAnalysisResponse.Data(), "HybridAnalysis")
 		redisData = responseContainer.String()
-		if !*flagCLI && cacheMiss != nil {
+		if checkCache && cacheMiss != nil {
 			client := redis.NewClient(&redis.Options{
 				Addr:     redisCluster + ":6379",
-				Password: "", // no password set
-				DB:       0,  // use default DB
+				Password: "",
+				DB:       0,
 			})
 			_, err := client.SetNX(IPAddress, redisData, 336*time.Hour).Result()
 
 			if err != nil {
-				log.Fatal(err)
+				log.Fatal("Error setting cache record", err)
 			}
 		}
+		// Expose data from redis cluster
 		responseData = redisData
-
-		//
 	}
-	responseContainer, _ := gabs.ParseJSON([]byte(responseData))
-	// Info
-	fmt.Println("\nIP Address:", IPAddress)
-	fmt.Println("AS:", responseContainer.Path("RiskIQ.autonomousSystemName").Data(), "-", responseContainer.Path("RiskIQ.autonomousSystemNumber").Data())
-	fmt.Println("Domain:", responseContainer.Path("AbuseDB.data.domain").Data().(string))
-	fmt.Println("Country:", responseContainer.Path("RiskIQ.country").Data())
-	fmt.Println("Usage:", responseContainer.Path("AbuseDB.data.usageType").Data())
 
-	var riskRating string
+	// Parse response from cache or API lookups
+	responseContainer, err := gabs.ParseJSON([]byte(responseData))
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	vtScoreMal := responseContainer.Path("VirusTotal.data.attributes.last_analysis_stats.malicious").Data().(float64) * 10
-	vtScoreSus := responseContainer.Path("VirusTotal.data.attributes.last_analysis_stats.suspicious").Data().(float64) * 10
-	AIDBScore := responseContainer.Path("AbuseDB.data.abuseConfidenceScore").Data().(float64)
-	combinedScore := vtScoreSus + vtScoreMal + AIDBScore
+	abuseReport := anubisResponse{
+		IPAddress:   IPAddress,
+		ASName:      (responseContainer.Path("RiskIQ.autonomousSystemName").Data()),
+		ASNumber:    responseContainer.Path("RiskIQ.autonomousSystemNumber").Data(),
+		Domain:      responseContainer.Path("AbuseDB.data.domain").Data().(string),
+		Country:     responseContainer.Path("RiskIQ.country").Data(),
+		Usage:       responseContainer.Path("AbuseDB.data.usageType").Data(),
+		vtScoreMal:  responseContainer.Path("VirusTotal.data.attributes.last_analysis_stats.malicious").Data().(float64) * 10,
+		vtScoreSus:  responseContainer.Path("VirusTotal.data.attributes.last_analysis_stats.suspicious").Data().(float64) * 10,
+		AIDBScore:   responseContainer.Path("AbuseDB.data.abuseConfidenceScore").Data().(float64),
+		Compromised: responseContainer.Path("RiskIQ.everCompromised"),
+	}
+
+	// Create risk rating from scores
+	combinedScore := abuseReport.vtScoreSus + abuseReport.vtScoreMal + abuseReport.AIDBScore
+	abuseReport.Total = combinedScore
 	if combinedScore < 60 {
-		riskRating = "Low"
+		abuseReport.RiskRating = "Low"
 	}
 	if combinedScore >= 60 {
-		riskRating = "Medium"
+		abuseReport.RiskRating = "Medium"
 	}
 	if combinedScore >= 80 {
-		riskRating = "High"
+		abuseReport.RiskRating = "High"
 	}
-	fmt.Println("\nRisk Rating:", riskRating, combinedScore)
 
-	// Abuse
-	fmt.Println("Compromised:", responseContainer.Path("RiskIQ.everCompromised"))
-	fmt.Println("AbuseDB Confidence Score:", AIDBScore)
-	fmt.Println("VirusTotal Malicious Score:", vtScoreMal)
-	fmt.Println("VirusTotal Suspicious Score:", vtScoreSus)
+	// Send response to the appropriate channel
+	// rawReport <- abuseReport
+	// fmt.Println(abuseReport)
+	if *flagJSON {
+		reportJSON := gabs.Wrap(abuseReport)
+		fmt.Println(reportJSON.String())
+
+	} else {
+		// make cute report
+		fmt.Println("\n", "IP Address:", abuseReport.IPAddress, "\n",
+			"AS Name:", abuseReport.ASName, "-", abuseReport.ASNumber, "\n",
+			"Domain:", abuseReport.Domain, "\n",
+			"Country:", abuseReport.Country, "\n",
+			"Usage:", abuseReport.Usage, "\n",
+			"Risk Rating:", abuseReport.RiskRating, "-", abuseReport.Total, "\n",
+			"VirusTotal Malicious Score:", abuseReport.vtScoreMal, "\n",
+			"AbuseDB Confidence Score:", abuseReport.AIDBScore, "\n",
+			"Compromised:", abuseReport.Compromised,
+		)
+	}
+	// Update the waitgroup status and return
+}
+
+func handleRequest() {
+	IPAddress := os.Getenv("IPADDRESS")
+	runningJobs.Add(1)
+	go anubisVerify(IPAddress, false, recordExpiration, runningJobs)
+	runningJobs.Wait()
+
+}
+
+func main() {
+	flag.Parse()
+	flag.Set("lambda", "false")
+	// CLI Execution options
+	if *flagCLI {
+		IPAddress := *flagIPAddress
+		runningJobs.Add(1)
+		go anubisVerify(IPAddress, false, recordExpiration, runningJobs)
+		runningJobs.Wait()
+	}
+	// Lambda execution options
+	if *flagLambda {
+		lambda.Start(handleRequest)
+	}
+	// development flags
+	if *flagDev {
+
+		// Import Bulk list of IP addresses from File, S3, or Event
+
+		BulkLookup := []string{}
+		// Process list of IP addresses
+		BulkLookup = append(BulkLookup, "120.79.27.209")
+		BulkLookup = append(BulkLookup, "120.79.27.249")
+		BulkLookup = append(BulkLookup, "12.79.27.209")
+
+		// Run anubis verification on addresses
+		runningJobs.Add(len(BulkLookup))
+		for index := range BulkLookup {
+			go anubisVerify(BulkLookup[index], false, 336, runningJobs)
+		}
+		runningJobs.Wait()
+	}
 
 }
