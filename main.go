@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -15,7 +16,11 @@ import (
 	"time"
 
 	"github.com/Jeffail/gabs/v2"
+	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/go-redis/redis/v7"
 )
 
@@ -70,6 +75,7 @@ var (
 		Password: "",
 		DB:       0,
 	})
+	sess *session.Session
 )
 
 func queryPassiveTotal(endpoint string, Query string) string {
@@ -244,7 +250,8 @@ func anubisVerify(IPAddress string, checkCache bool, recordExpiration int, wg *s
 	// Parse response from cache or API lookups
 	responseContainer, err := gabs.ParseJSON([]byte(responseData))
 	if err != nil {
-		log.Fatal(err)
+		log.Println("Failed to parse response from cache ", responseData, err)
+		return
 	}
 
 	// response validation
@@ -342,6 +349,57 @@ func handleRequest() {
 
 }
 
+func handleRequestS3(ctx context.Context, EventData events.S3Event) {
+	// Import Bulk list of IP addresses from File, S3,http, or Event
+	// IPListURL := "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/cleantalk_new_1d.ipset"
+	Records := EventData.Records
+	var BucketName string
+	var LogFileName string
+	var LogContents []byte
+	sess = session.New()
+	S3Client := s3.New(sess)
+
+	for i := range Records {
+		BucketName = Records[i].S3.Bucket.Name
+		LogFileName = Records[i].S3.Object.Key
+		S3InputObject := s3.GetObjectInput{
+			Bucket: aws.String(BucketName),
+			Key:    aws.String(LogFileName),
+		}
+
+		LogObject, err := S3Client.GetObject(&S3InputObject)
+		if err != nil {
+			log.Fatal("An error occured when attempting to retrieve", BucketName, LogFileName, err)
+		}
+		LogContents, err = ioutil.ReadAll(LogObject.Body)
+		if err != nil {
+			log.Fatal("An error occured when attempting to read", BucketName, LogFileName, err)
+		}
+
+	}
+
+	responseString := string(LogContents)
+	responseSlice := strings.Split(responseString, "\n")
+
+	BulkLookup := []string{}
+	for i := range responseSlice {
+		lineComment, _ := regexp.Match("^#", []byte(responseSlice[i]))
+		if !lineComment && responseSlice[i] != "" {
+			// Remove network masks
+			responseSlice[i] = strings.Split(responseSlice[i], "/")[0]
+			BulkLookup = append(BulkLookup, responseSlice[i])
+		}
+	}
+	// Add IP addresses to queue
+	runningJobs.Add(len(BulkLookup))
+	// Run anubis verification on addresses
+	for index := range BulkLookup {
+		go anubisVerify(BulkLookup[index], true, 336, runningJobs)
+	}
+	runningJobs.Wait()
+
+}
+
 func main() {
 	flag.Parse()
 
@@ -358,9 +416,7 @@ func main() {
 	}
 	// Lambda execution options
 	if os.Getenv("LAMBDA") == "TRUE" {
-		lambda.Start(handleRequest)
-	}
-	if *flagDev {
+		lambda.Start(handleRequestS3)
 	}
 
 }
