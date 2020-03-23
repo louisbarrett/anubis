@@ -56,6 +56,7 @@ var (
 	hybridAnalysisKey    = os.Getenv("HAKEY")
 	hybridAnalysisSecret = os.Getenv("HASECRET")
 	vtAPIKey             = os.Getenv("VTAPIKEY")
+	APIResponse          string
 
 	flagLambda    = flag.Bool("lambda", false, "Toggle lambda execution")
 	flagIPAddress = flag.String("ip", "", "IP Address to lookup")
@@ -303,6 +304,7 @@ func anubisVerify(IPAddress string, checkCache bool, recordExpiration int, wg *s
 	// Send response to the appropriate channel
 	if *flagJSON {
 		reportJSON := gabs.Wrap(abuseReport)
+		APIResponse = reportJSON.String()
 		fmt.Println(reportJSON.String())
 
 	} else {
@@ -350,14 +352,16 @@ func handleRequest() {
 }
 
 func handleRequestS3(ctx context.Context, EventData events.S3Event) {
-	// Import Bulk list of IP addresses from File, S3,http, or Event
-	// IPListURL := "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/cleantalk_new_1d.ipset"
 	Records := EventData.Records
 	var BucketName string
 	var LogFileName string
 	var LogContents []byte
 	sess = session.New()
 	S3Client := s3.New(sess)
+
+	if os.Getenv("DEBUG") == "TRUE" {
+		fmt.Println(ctx)
+	}
 
 	for i := range Records {
 		BucketName = Records[i].S3.Bucket.Name
@@ -400,6 +404,26 @@ func handleRequestS3(ctx context.Context, EventData events.S3Event) {
 
 }
 
+func handlerAPI(ctx context.Context, EventData events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+
+	ParsedJSON, err := gabs.ParseJSON([]byte(EventData.Body))
+	if err != nil {
+		log.Fatal(err)
+	}
+	IPAddress := ParsedJSON.Path("IPAddress").Data()
+	if IPAddress != nil {
+		*flagJSON = true
+		runningJobs.Add(1)
+		go anubisVerify(IPAddress.(string), true, recordExpiration, runningJobs)
+		runningJobs.Wait()
+
+	}
+
+	return events.APIGatewayProxyResponse{
+		StatusCode: http.StatusOK,
+		Body:       APIResponse}, nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -416,7 +440,8 @@ func main() {
 	}
 	// Lambda execution options
 	if os.Getenv("LAMBDA") == "TRUE" {
-		lambda.Start(handleRequestS3)
+		lambda.Start(handlerAPI)
+		// lambda.Start(handleRequestS3)
 	}
 
 }
